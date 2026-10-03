@@ -1,0 +1,4 @@
+pillow
+pyserial
+scikit-learn
+numpy
