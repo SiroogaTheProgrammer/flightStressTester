@@ -229,8 +229,7 @@ def main():
                 sys.exit(1)
 
         plan = [i % len(paths) for i in range(len(paths) * args.repeat)]
-        deadline = time.monotonic() + args.seconds if args.seconds else None
-        if deadline:
+        if args.seconds:
             plan = None
 
         expected = {}
@@ -241,6 +240,8 @@ def main():
         sent_at, dets, rows = {}, {}, []
         saved = set()
         next_id, completed, mismatches, started = 0, 0, 0, time.perf_counter()
+        deadline = time.monotonic() + args.seconds if args.seconds else None
+        acknowledged = set()
         total = len(plan) if plan else None
         print(f"{'id':>4} {'image':<18} {'det':>3} {'pico ms':>8} {'decode':>7} {'usb rx':>7} {'e2e ms':>8}  result")
         while True:
@@ -254,13 +255,30 @@ def main():
             try:
                 line = link.lines.get(timeout=60)
             except queue.Empty:
-                raise SystemExit("Timed out waiting for the Pico")
+                pending = sorted(sent_at)
+                received = sorted(acknowledged.intersection(sent_at))
+                link.send(b"STATUS\n")
+                try:
+                    status = link.wait("STATUS,", 5)
+                except TimeoutError:
+                    status = "No STATUS reply (older firmware or stalled receiver)"
+                raise SystemExit(
+                    f"Timed out waiting for results on {link.port.port}. Pending image IDs: {pending}; "
+                    f"receive acknowledgements: {received}. "
+                    f"Device state: {status}. "
+                    "If acknowledged, investigate core 1 inference; otherwise investigate reception "
+                    "or use firmware with RECEIVED acknowledgements."
+                )
             fields = line.split(",")
-            if fields[0] == "DET":
+            if fields[0] == "RECEIVED":
+                acknowledged.add(int(fields[1]))
+                print(f"  Pico received image {fields[1]} ({fields[2]} bytes)")
+            elif fields[0] == "DET":
                 dets.setdefault(int(fields[1]), []).append(tuple(int(v) for v in fields[2:8]))
             elif fields[0] == "RESULT":
                 rid = int(fields[1])
                 t_sent, image_index = sent_at.pop(rid)
+                acknowledged.discard(rid)
                 e2e = (time.perf_counter() - t_sent) * 1000
                 infer, decode, rx = int(fields[3]), int(fields[4]), int(fields[5])
                 checksum = int(fields[10], 16)
@@ -281,7 +299,7 @@ def main():
                     saved.add(image_index)
                     annotate(prepared[image_index][0], found, size, names, args.save_dir / f"{paths[image_index].stem}_pico.jpg")
             elif fields[0] in ("ERR", "LINKERR"):
-                print("  ", line)
+                raise SystemExit(f"Pico benchmark failed: {line}")
         elapsed = time.perf_counter() - started
 
         if rows:

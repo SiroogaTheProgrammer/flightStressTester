@@ -48,13 +48,16 @@ volatile uint32_t g_conf_permil = 300;
 volatile uint32_t g_iou_permil = 400;
 volatile bool g_debug_sums = false;
 volatile bool g_reset_stats = false;
+volatile uint32_t g_core1_phase = 0;
 
 void core1_main() {
     uint64_t total_us = 0;
     uint32_t completed = 0, min_us = 0xFFFFFFFFu, max_us = 0;
     while (true) {
         uint32_t index;
+        g_core1_phase = 1;
         queue_remove_blocking(&g_full_q, &index);
+        g_core1_phase = 2;
         const Slot& slot = g_slots[index];
         std::memcpy(g_arena + kInputOffset, slot.pixels, kInputBytes);
         g_core1_result.id = slot.id;
@@ -70,9 +73,12 @@ void core1_main() {
         }
 
         const uint32_t t0 = time_us_32();
+        g_core1_phase = 3;
         run_network(g_arena, g_profile_us, g_debug_sums ? g_profile_sum : nullptr);
         const uint32_t t1 = time_us_32();
+        g_core1_phase = 4;
         g_core1_result.checksum = output_checksum(g_arena);
+        g_core1_phase = 5;
         g_core1_result.count = static_cast<uint32_t>(decode_detections(
             g_arena, g_conf_permil / 1000.0f, g_iou_permil / 1000.0f, g_core1_result.dets, kMaxDetections));
         const uint32_t t2 = time_us_32();
@@ -88,6 +94,7 @@ void core1_main() {
         g_core1_result.min_us = min_us;
         g_core1_result.max_us = max_us;
         g_core1_result.completed = completed;
+        g_core1_phase = 6;
         queue_add_blocking(&g_result_q, &g_core1_result);
     }
 }
@@ -126,6 +133,10 @@ bool starts_with(const char* s, const char* prefix) { return std::strncmp(s, pre
 void handle_line(const char* line) {
     if (std::strcmp(line, "HELLO") == 0) {
         print_ready();
+    } else if (std::strcmp(line, "STATUS") == 0) {
+        printf("STATUS,%lu,%lu,%lu,%lu\n", ul(g_core1_phase),
+               ul(queue_get_level(&g_full_q)), ul(queue_get_level(&g_free_q)),
+               ul(queue_get_level(&g_result_q)));
     } else if (starts_with(line, "IMG,")) {
         g_pending_id = static_cast<uint32_t>(std::strtoul(line + 4, nullptr, 10));
         g_state = State::WaitSlot;
@@ -156,7 +167,7 @@ void service_input() {
         case State::Line: {
             char c;
             if (stdio_usb.in_chars(&c, 1) != 1) {
-                __wfi();
+                tight_loop_contents();
                 break;
             }
             if (c == '\n' || c == '\r') {
@@ -191,12 +202,13 @@ void service_input() {
                 g_state = State::Line;
                 break;
             } else {
-                __wfi();
+                tight_loop_contents();
             }
             if (g_received == static_cast<uint32_t>(kInputBytes)) {
                 g_slots[g_slot_index].id = g_pending_id;
                 g_slots[g_slot_index].rx_us = now - g_rx_start;
                 queue_try_add(&g_full_q, &g_slot_index);
+                printf("RECEIVED,%lu,%lu\n", ul(g_pending_id), ul(g_received));
                 g_state = State::Line;
             }
             break;
