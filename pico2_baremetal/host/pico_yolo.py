@@ -1,4 +1,5 @@
 import argparse
+import json
 import queue
 import statistics
 import sys
@@ -6,6 +7,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +21,65 @@ SAMPLES = {
 }
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 PICO_VID = 0x2E8A
+
+
+def coco128_images(count):
+    folder = Path(tempfile.gettempdir()) / "pico_yolo_cache"
+    image_dir = folder / "coco128" / "images" / "train2017"
+    label_dir = folder / "coco128" / "labels" / "train2017"
+    archive = folder / "coco128.zip"
+    if not image_dir.exists() or not label_dir.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        if not archive.exists():
+            urllib.request.urlretrieve(
+                "https://github.com/ultralytics/assets/releases/download/v0.0.0/coco128.zip", archive
+            )
+        with zipfile.ZipFile(archive) as bundle:
+            for member in bundle.infolist():
+                parts = Path(member.filename).parts
+                if (len(parts) == 4 and parts[0] == "coco128" and parts[1] in ("images", "labels")
+                        and parts[2] == "train2017" and Path(parts[3]).suffix in (".jpg", ".txt")):
+                    target = folder.joinpath(*parts)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(bundle.read(member))
+    paths = sorted(image_dir.glob("*.jpg"))[:count]
+    with zipfile.ZipFile(archive) as bundle:
+        members = set(bundle.namelist())
+        for path in paths:
+            label_path = label_dir / f"{path.stem}.txt"
+            member = f"coco128/labels/train2017/{path.stem}.txt"
+            if not label_path.exists():
+                if member in members:
+                    label_path.write_bytes(bundle.read(member))
+                else:
+                    label_path.write_text("")
+    return paths, label_dir
+
+
+def score_detections(detections, label_path, size, match_iou=0.5):
+    if not label_path.is_file():
+        raise ValueError(f"Missing ground-truth labels: {label_path}")
+    targets = []
+    for line in label_path.read_text().splitlines():
+        cls, cx, cy, width, height = map(float, line.split())
+        targets.append((int(cls), (cx - width / 2) * size, (cy - height / 2) * size,
+                        (cx + width / 2) * size, (cy + height / 2) * size))
+    matched = set()
+    true_positives = 0
+    for cls, score, x1, y1, x2, y2 in sorted(detections, key=lambda detection: -detection[1]):
+        best_iou, best_index = match_iou, None
+        for index, (expected_class, gx1, gy1, gx2, gy2) in enumerate(targets):
+            if index in matched or cls != expected_class:
+                continue
+            intersection = max(0, min(x2, gx2) - max(x1, gx1)) * max(0, min(y2, gy2) - max(y1, gy1))
+            union = max(0, x2 - x1) * max(0, y2 - y1) + (gx2 - gx1) * (gy2 - gy1) - intersection
+            overlap = intersection / union if union > 0 else 0
+            if overlap >= best_iou:
+                best_iou, best_index = overlap, index
+        if best_index is not None:
+            matched.add(best_index)
+            true_positives += 1
+    return true_positives, len(detections) - true_positives, len(targets) - true_positives
 
 
 def find_port(requested):
@@ -191,6 +252,9 @@ def main():
     parser.add_argument("--images", nargs="+", type=Path, help="Image files to run")
     parser.add_argument("--dir", nargs="+", type=Path, help="Folders whose images are run")
     parser.add_argument("--samples", action="store_true", help="Download and run the two sample images")
+    parser.add_argument("--coco128", action="store_true", help="Evaluate labeled COCO128 images on the Pico")
+    parser.add_argument("--count", type=int, default=128, help="Number of COCO128 images (1-128)")
+    parser.add_argument("--report", type=Path, help="Save labeled evaluation results as JSON")
     parser.add_argument("--repeat", type=int, default=1, help="Run the whole list this many times")
     parser.add_argument("--seconds", type=float, default=0, help="Keep cycling the list for this long (stress test)")
     parser.add_argument("--conf", type=float, default=0.3, help="Confidence threshold")
@@ -204,8 +268,13 @@ def main():
     args = parser.parse_args()
     if args.repeat < 1 or args.window < 1:
         parser.error("--repeat and --window must be at least 1")
+    if args.coco128 and (args.samples or args.images or args.dir or args.seconds or args.repeat != 1):
+        parser.error("--coco128 evaluates distinct images once; do not combine it with other inputs or repetition")
+    if not 1 <= args.count <= 128:
+        parser.error("--count must be between 1 and 128")
 
-    paths = collect_images(args)
+    paths, label_dir = coco128_images(args.count) if args.coco128 else (collect_images(args), None)
+    evaluations = []
     names = (ROOT / "yolo" / "coco.names").read_text().split("\n")
     yq, graph = load_reference()
 
@@ -290,6 +359,11 @@ def main():
                 seen_checksum.setdefault(image_index, checksum)
                 mismatches += status.startswith(("MISMATCH", "UNSTABLE"))
                 found = dets.pop(rid, [])
+                if label_dir is not None:
+                    tp, fp, fn = score_detections(found, label_dir / f"{paths[image_index].stem}.txt", size)
+                    evaluations.append({"image": paths[image_index].name, "tp": tp, "fp": fp, "fn": fn,
+                                        "inference_us": infer, "decode_us": decode,
+                                        "detections": found})
                 rows.append((infer, decode, rx, e2e))
                 completed += 1
                 label = ", ".join(f"{names[c]} {s / 1000:.2f}" for c, s, *_ in found[:4]) + (" ..." if len(found) > 4 else "")
@@ -301,6 +375,32 @@ def main():
             elif fields[0] in ("ERR", "LINKERR"):
                 raise SystemExit(f"Pico benchmark failed: {line}")
         elapsed = time.perf_counter() - started
+
+        if evaluations:
+            def summarize(records):
+                tp = sum(record["tp"] for record in records)
+                fp = sum(record["fp"] for record in records)
+                fn = sum(record["fn"] for record in records)
+                positive = sum(record["tp"] + record["fn"] > 0 for record in records)
+                return {"images": len(records), "tp": tp, "fp": fp, "fn": fn,
+                        "precision": tp / (tp + fp) if tp + fp else 0,
+                        "recall": tp / (tp + fn) if tp + fn else 0,
+                        "images_with_correct_detection": sum(record["tp"] > 0 for record in records),
+                        "positive_images": positive}
+            summary = summarize(evaluations)
+            held_out = summarize(evaluations[96:])
+            print("\nGround truth: matching class and box IoU >= 0.5, at the configured confidence threshold.")
+            for name, stats in (("COCO128", summary), ("Held-out (after first 96 calibration images)", held_out)):
+                if stats["images"]:
+                    print(f"{name}: {stats['images']} images; TP={stats['tp']} FP={stats['fp']} FN={stats['fn']}; "
+                          f"precision={stats['precision']:.2%}, recall={stats['recall']:.2%}; "
+                          f"images with a correct detection={stats['images_with_correct_detection']}/{stats['positive_images']}")
+            if args.report:
+                args.report.parent.mkdir(parents=True, exist_ok=True)
+                args.report.write_text(json.dumps({"confidence": args.conf, "match_iou": 0.5,
+                                                  "input_size": size, "clock_mhz": mhz,
+                                                  "summary": summary, "held_out": held_out,
+                                                  "images": evaluations}, indent=2))
 
         if rows:
             infer = [r[0] / 1000 for r in rows]
